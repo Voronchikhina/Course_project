@@ -1,0 +1,151 @@
+!pip3 install torchaudio
+!pip3 install pydub
+
+import librosa
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import scipy
+from pydub import AudioSegment
+import math
+
+def Fourier(amplituds,sample_rate=44100, hop_length=512, fmin=20,fmax=22050, n_mels=128, window_length=2560):
+  massiv=np.pad(amplituds, int(window_length), mode='reflect')
+  frame=librosa.util.frame(massiv,frame_length=window_length, hop_length=hop_length)
+  fwindow=librosa.core.spectrum.get_window('hann', window_length, fftbins=True)
+  sf=scipy.fft.rfft(frame*fwindow[:, None], axis=0)
+  spectogram=np.abs(sf ** 2)
+  mel_basis = librosa.filters.mel(sample_rate, n_fft=window_length,
+                                    n_mels=n_mels, fmin=fmin, fmax=fmax)
+  mel_spectrogram = mel_basis.dot(spectogram)
+  mel=torch.from_numpy(mel_spectrogram)
+  return mel.reshape(1,n_mels, -1).float()
+  
+  
+def separate(name, tmin, tmax, step_ms=1500):
+  origAudio = AudioSegment.from_file(name)
+  duration = int(math.floor(origAudio.duration_seconds * 1000))
+
+  assert tmax <= tmin + step_ms
+
+  fname = f"{name}_{tmin}.wav"
+  segment = origAudio[tmin:tmin + step_ms]
+  segment.export(fname, format="wav")
+  amplit, sr = librosa.load(fname, 44100)
+  trains = Fourier(amplit,sample_rate,hop_length,fmin,fmax,n_mels,window_length)
+  segments_1 = [trains]
+
+  segments_0 = []
+  for offset in range(0, duration, step_ms):
+    end = offset + step_ms
+    if end < duration:
+      if end < tmin or offset > tmax:
+        newSegment = origAudio[offset:offset + step_ms]
+
+        fname = f"{name}_{offset}.wav"
+        newSegment.export(fname, format="wav")
+        amplit, sr = librosa.load(fname, 44100)
+        trains = Fourier(amplit,sample_rate,hop_length,fmin,fmax,n_mels,window_length)
+        segments_0.append(trains)
+
+  return segments_1, segments_0
+  
+def get_answer(size, valid):
+  if valid:
+    return torch.ones(size, dtype=torch.long) 
+  else:
+    return torch.zeros(size, dtype=torch.long)
+    
+def get_vector_fromfile(filename):
+  Allsegment=[]
+  target=[]
+  allseg_1=[]
+  allseg_0=[]
+  ansall_0=[]
+  ansall_1= []
+  f=open(filename,'r')
+  for line in f:
+    if not line.strip():
+      continue
+    spisok= line.split(' ')
+    name = spisok[0]
+    tmin = float(spisok[1])
+    tmax = float(spisok[2])
+    segments_1, segments_0 = separate(name,tmin, tmax)
+    allseg_1+=segments_1
+    allseg_0+=segments_0
+    ans_1 = get_answer(len(segments_1), True)
+    ans_0 = get_answer(len(segments_0), False)
+    ansall_1+=ans_1
+    ansall_0+=ans_0
+  target =ansall_1+ansall_0
+  targets=torch.stack(target)
+  Allsegment= allseg_1+ allseg_0
+  Allsegments=torch.cat(Allsegment, dim=0)  
+  return Allsegments, targets
+
+batch_size=100
+learning_rate=0.01
+epochs=10
+log_interval=10
+
+class Net(nn.Module):
+  def __init__(self, n_input=1, n_output=1, stride=16, n_channel=64):
+    super( Net, self).__init__()
+    self.conv1 = nn.Conv1d(n_input, n_channel, kernel_size=80, stride=stride)
+    self.bn1 = nn.BatchNorm1d(n_channel)
+    self.conv2 = nn.Conv1d(n_channel, 2 * n_channel, kernel_size=3)
+    self.fc1 = nn.Linear(2 * n_channel, n_output)
+    
+  def forward(self, x):
+    x = self.conv1(x)
+    x = self.bn1(x)
+    x = F.relu(x)
+        
+    x = self.conv2(x)
+    
+    x = F.relu(x)
+  
+    x = x.permute(0, 2, 1)
+    x = self.fc1(x)
+    return F.log_softmax(x, dim=2)
+
+net = Net(n_input=128)
+
+sample_rate=44100
+hop_length=512
+fmin=20
+fmax=22050
+n_mels=128
+window_length=2560
+
+Allsegments, targets = get_vector_fromfile('infofile.txt')
+for i in range(0, len(Allsegments), batch_size):
+  train_loader = Allsegments[i: i+batch_size, :,:]
+  optimizer = optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9)
+  criterion = nn.NLLLoss() 
+  for epoch in range(epochs):
+    optimizer.zero_grad()
+    net_out = net(train_loader)
+    loss = criterion(net_out,targets[i: i+ batch_size].reshape(-1, 1) )
+    loss.backward() 
+    optimizer.step()
+    if i % log_interval == 0:
+      print('Train Epoch: {} \tLoss: {:.6f}'.format(
+                    epoch, loss.data))
+
+#test part
+Allsegment, target = get_vector_fromfile('testfile.txt')
+test_loss = 0
+correct = 0
+test_loader= Allsegment
+net_out = net(test_loader)
+test_loss += criterion(net_out, target.reshape(-1,1)).data
+pred = net_out.data.max(1)[1]  # get the index of the max log-probability
+correct += pred.eq(target.data).sum()
+test_loss /= len(test_loader)
+print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(test_loader),
+        100. * correct / len(test_loader)))
